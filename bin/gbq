@@ -421,7 +421,8 @@ cmd_ctx() {
       local raw; raw=$(ctx_list_raw)
       [ -z "$raw" ] && { echo "(还没注册任何上下文，用 gbq ctx add <目录>)"; return 0; }
       printf '%-20s %s\n' 'NAME' 'LOCAL PATH'
-      echo "$raw" | while IFS=$'\t' read -r n p; do printf '%-20s %s\n' "$n" "$p"; done
+      # while read 在 EOF 时返回 1，不加 || true 会让整条命令误报失败
+      echo "$raw" | while IFS=$'\t' read -r n p; do printf '%-20s %s\n' "$n" "$p"; done || true
       ;;
     sync)
       shift
