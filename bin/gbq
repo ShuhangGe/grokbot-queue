@@ -1,0 +1,336 @@
+#!/bin/bash
+# gbq — Grok Bot 任务队列
+# 把一批任务分发给多个 Grok Bot 并行执行，本地开销恒定。
+#
+#   gbq setup                    引导式配置
+#   gbq bots                     列出可用 Bot
+#   gbq submit <任务> [...]       把任务写进队列（轮流分配给各 Bot）
+#   gbq submit -f tasks.txt      从文件读，每行一个任务
+#   gbq submit -b <bot> <任务>    指定 Bot
+#   gbq dispatch                 唤醒有待办任务的 Bot（每 Bot 一条消息）
+#   gbq run <任务> [...]          submit + dispatch + wait + collect 一条龙
+#   gbq status                   查看各队列状态
+#   gbq collect [-o 目录]         把结果取回本地
+#   gbq wait [--timeout 秒]       等到所有任务完成
+#   gbq send -b <bot> <消息>      直接给某个 Bot 发一条消息（不走队列）
+#   gbq clean                    清空队列
+set -euo pipefail
+
+GBQ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$GBQ_ROOT/lib/common.sh"
+
+# -E 必须加：BSD sed(macOS) 不认 \? 和 \+，同一个坑踩过两次
+usage() { sed -n '2,16p' "$0" | sed -E 's/^# ?//'; }
+
+# ============ setup ============
+cmd_setup() {
+  echo "${_c_bld}gbq 配置向导${_c_off}"
+  echo
+
+  # 1. 依赖
+  for c in ssh node python3 curl lsof; do
+    command -v "$c" >/dev/null 2>&1 || die "缺少依赖: $c"
+  done
+  ok "依赖齐全 (ssh node python3 curl lsof)"
+
+  # 2. Grok Bot 是否在跑
+  GBQ_APP_PROC="${GBQ_APP_PROC:-MacOS/Grok Bot}"
+  if pgrep -f "$GBQ_APP_PROC" >/dev/null 2>&1; then
+    ok "Grok Bot 桌面应用正在运行"
+  else
+    die "Grok Bot 桌面应用未运行。请先打开它（本工具靠它投递任务）"
+  fi
+
+  # 3. SSH 目标
+  echo
+  echo "需要一个能 SSH 登录 Grok Bot 云端机器的地址。"
+  echo "  ${_c_dim}通常是 Tailscale 里那台 Linux 节点，用户名 box${_c_dim}"
+  echo "  ${_c_dim}例: box@100.x.x.x  或已在 ~/.ssh/config 配好的别名${_c_off}"
+  echo
+  # 尝试自动探测 tailscale 上的 linux 节点
+  local guess=""
+  if command -v tailscale >/dev/null 2>&1; then
+    guess=$(tailscale status 2>/dev/null | awk '$4=="linux"{print $1; exit}')
+    [ -n "$guess" ] && echo "  探测到 Tailscale Linux 节点: ${_c_grn}$guess${_c_off}"
+  fi
+  local default_host=""
+  [ -n "$guess" ] && default_host="box@$guess"
+  read -r -p "SSH 目标${default_host:+ [$default_host]}: " GBQ_SSH_HOST
+  GBQ_SSH_HOST="${GBQ_SSH_HOST:-$default_host}"
+  [ -z "$GBQ_SSH_HOST" ] && die "必须提供 SSH 目标"
+
+  # 4. 测试 SSH
+  echo
+  info "测试 SSH 连接…"
+  if check_ssh; then
+    ok "SSH 可用: $GBQ_SSH_HOST"
+  else
+    echo
+    warn "SSH 连不上。云端机器默认没有 sshd，需要先让 Bot 装好。"
+    echo "在 Grok Bot 对话里把下面这段发给任意一个 Bot，然后重跑 gbq setup："
+    echo
+    local pub=""
+    for k in ~/.ssh/id_ed25519.pub ~/.ssh/grokbot_ed25519.pub ~/.ssh/id_rsa.pub; do
+      [ -f "$k" ] && { pub=$(cat "$k"); break; }
+    done
+    if [ -z "$pub" ]; then
+      warn "本地没有 SSH 公钥，先生成一把："
+      echo "  ssh-keygen -t ed25519 -f ~/.ssh/grokbot_ed25519 -N ''"
+      exit 1
+    fi
+    cat <<EOF
+${_c_dim}---8<---${_c_off}
+执行下面命令并把输出贴回：sudo apt-get update -qq && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server; sudo mkdir -p /run/sshd; mkdir -p ~/.ssh && chmod 700 ~/.ssh; echo "$pub" >> ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; TSIP=\$(tailscale ip -4 2>/dev/null | head -1); sudo tailscale set --ssh=false 2>/dev/null; sudo sh -c "nohup /usr/sbin/sshd -D -o ListenAddress=\$TSIP -o PasswordAuthentication=no > /tmp/sshd.log 2>&1 &"; sleep 3; ss -tlnp | grep :22
+${_c_dim}---8<---${_c_off}
+
+注意: sshd 只监听 Tailscale 地址，不会暴露到公网。
+EOF
+    exit 1
+  fi
+
+  # 5. 远端队列根目录
+  GBQ_REMOTE_ROOT="${GBQ_REMOTE_ROOT:-/workspace/gbq}"
+  gssh "mkdir -p '$GBQ_REMOTE_ROOT'" || die "无法创建 $GBQ_REMOTE_ROOT"
+  ok "远端队列目录: $GBQ_REMOTE_ROOT"
+
+  # 6. Bot 列表
+  echo
+  info "读取 Bot 列表…"
+  local bots; bots=$(bot_list 2>/dev/null || true)
+  inspector_close
+  if [ -n "$bots" ] && ! echo "$bots" | grep -qE 'NOT_RUNNING|UNAVAILABLE|NO_WINDOW'; then
+    ok "发现 Bot:"; echo "$bots" | sed 's/^/    • /'
+  else
+    warn "读不到 Bot 列表（${bots}）。Grok Bot 窗口是否已打开？"
+  fi
+
+  save_config
+  echo
+  ok "配置已保存到 $GBQ_CONFIG"
+  echo
+  echo "接下来试试:  ${_c_bld}gbq run '查一下 uname -a 并告诉我内核版本'${_c_off}"
+}
+
+# ============ bots ============
+cmd_bots() {
+  load_config
+  local out; out=$(bot_list)
+  inspector_close
+  case "$out" in
+    *GROKBOT_NOT_RUNNING*) die "Grok Bot 应用未运行" ;;
+    *INSPECTOR_UNAVAILABLE*) die "无法连接 Grok Bot（inspector 打不开）" ;;
+    *NO_WINDOW*) die "Grok Bot 没有打开的窗口" ;;
+  esac
+  [ -z "$out" ] && die "没有找到任何 Bot"
+  echo "$out"
+}
+
+# 取 Bot 列表到数组 BOTS[]
+_load_bots() {
+  local out; out=$(bot_list)
+  case "$out" in
+    *GROKBOT_NOT_RUNNING*|*INSPECTOR_UNAVAILABLE*|*NO_WINDOW*|"")
+      die "无法获取 Bot 列表: ${out:-空}" ;;
+  esac
+  BOTS=(); while IFS= read -r l; do [ -n "$l" ] && BOTS+=("$l"); done <<< "$out"
+}
+
+# ============ submit ============
+cmd_submit() {
+  load_config
+  local target_bot="" from_file="" tasks=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -b) target_bot="$2"; shift 2 ;;
+      -f) from_file="$2"; shift 2 ;;
+      *)  tasks+=("$1"); shift ;;
+    esac
+  done
+  if [ -n "$from_file" ]; then
+    [ -f "$from_file" ] || die "找不到文件: $from_file"
+    while IFS= read -r l; do
+      l="${l#"${l%%[![:space:]]*}"}"      # ltrim
+      [ -z "$l" ] && continue
+      [ "${l:0:1}" = "#" ] && continue
+      tasks+=("$l")
+    done < "$from_file"
+  fi
+  [ ${#tasks[@]} -eq 0 ] && die "没有任务。用法: gbq submit '任务1' '任务2'  或  gbq submit -f tasks.txt"
+
+  if [ -n "$target_bot" ]; then
+    BOTS=("$target_bot")
+  else
+    _load_bots
+    inspector_close
+  fi
+
+  local n=${#BOTS[@]} i=0 stamp
+  stamp=$(date -u +%Y%m%d-%H%M%S)
+  info "把 ${#tasks[@]} 个任务轮流分配给 $n 个 Bot…"
+
+  # 组装一条远端脚本，一次 SSH 写完所有任务（避免 N 次往返）
+  local script="set -e"
+  for t in "${tasks[@]}"; do
+    local bot="${BOTS[$((i % n))]}"
+    local slug; slug=$(slugify "$bot")
+    local id="${stamp}-$(printf '%03d' $i)"
+    local b64; b64=$(printf '%s' "$t" | base64 | tr -d '\n')
+    script="$script
+mkdir -p '$GBQ_REMOTE_ROOT/$slug/inbox' '$GBQ_REMOTE_ROOT/$slug/outbox'
+printf '%s' '$b64' | base64 -d > '$GBQ_REMOTE_ROOT/$slug/inbox/$id.task'
+echo '  $id -> $bot'"
+    i=$((i+1))
+  done
+  gssh "$script"
+  ok "已写入队列。下一步: gbq dispatch"
+}
+
+# ============ dispatch ============
+_wake_prompt() {
+  local slug="$1"
+  cat <<EOF
+你有一批任务在 $GBQ_REMOTE_ROOT/$slug/inbox/ 目录下，请按下面的协议自主处理，不要问我问题：
+
+1. 用 ls 列出 $GBQ_REMOTE_ROOT/$slug/inbox/*.task
+2. 对每一个任务文件：读取文件内容（那就是任务描述），完成它
+3. 完成后把结果写到 $GBQ_REMOTE_ROOT/$slug/outbox/<同名>.json，内容为一行 JSON：
+   {"id":"<文件名去掉.task>","status":"ok","result":"<结果摘要>","finished":"<date -u +%FT%TZ>"}
+   失败则 status 写 "error"，并加 "error":"<原因>" 字段
+4. 每完成一个就立刻写它的结果文件，不要攒到最后
+5. 全部处理完后，把已处理的 .task 文件删掉，然后只回复一行：ALL_DONE <处理数量>
+
+重要：结果写进文件即可，不要在对话里长篇输出。
+EOF
+}
+
+cmd_dispatch() {
+  load_config
+  _load_bots
+  local dispatched=0
+  for bot in "${BOTS[@]}"; do
+    local slug; slug=$(slugify "$bot")
+    local pending
+    pending=$(gssh "ls '$GBQ_REMOTE_ROOT/$slug/inbox/'*.task 2>/dev/null | wc -l | tr -d ' '" || echo 0)
+    if [ "${pending:-0}" -gt 0 ]; then
+      info "唤醒 ${bot}（${pending} 个待办）…"
+      local res; res=$(bot_dispatch "$bot" "$(_wake_prompt "$slug")") || true
+      case "$res" in
+        *SENT*) ok "$bot 已唤醒"; dispatched=$((dispatched+1)) ;;
+        *)      warn "$bot 唤醒失败: $res" ;;
+      esac
+    fi
+  done
+  inspector_close
+  [ "$dispatched" -eq 0 ] && { warn "没有待办任务"; return 0; }
+  ok "已唤醒 $dispatched 个 Bot，它们正在并行工作"
+}
+
+# ============ status ============
+cmd_status() {
+  load_config
+  gssh "
+    root='$GBQ_REMOTE_ROOT'
+    [ -d \"\$root\" ] || { echo '(队列为空)'; exit 0; }
+    printf '%-22s %8s %8s\n' 'BOT' 'INBOX' 'OUTBOX'
+    for d in \"\$root\"/*/; do
+      [ -d \"\$d\" ] || continue
+      b=\$(basename \"\$d\")
+      i=\$(ls \"\$d/inbox/\"*.task 2>/dev/null | wc -l | tr -d ' ')
+      o=\$(ls \"\$d/outbox/\"*.json 2>/dev/null | wc -l | tr -d ' ')
+      printf '%-22s %8s %8s\n' \"\$b\" \"\$i\" \"\$o\"
+    done
+  "
+}
+
+# ============ wait ============
+cmd_wait() {
+  load_config
+  local timeout=900
+  [ "${1:-}" = "--timeout" ] && timeout="$2"
+  local t0; t0=$(date +%s)
+  info "等待所有任务完成（超时 ${timeout}s）…"
+  while :; do
+    local pending
+    pending=$(gssh "ls '$GBQ_REMOTE_ROOT'/*/inbox/*.task 2>/dev/null | wc -l | tr -d ' '" || echo 0)
+    [ "${pending:-0}" -eq 0 ] && { ok "全部完成"; return 0; }
+    local now; now=$(date +%s)
+    if [ $((now - t0)) -ge "$timeout" ]; then
+      warn "超时，仍有 $pending 个未完成"; return 1
+    fi
+    sleep 8
+  done
+}
+
+# ============ collect ============
+cmd_collect() {
+  load_config
+  local out="./gbq-results"
+  [ "${1:-}" = "-o" ] && { out="$2"; shift 2; }
+  mkdir -p "$out"
+  local tmp; tmp=$(mktemp -d)
+  if gssh "cd '$GBQ_REMOTE_ROOT' 2>/dev/null && tar cf - */outbox 2>/dev/null" | tar xf - -C "$tmp" 2>/dev/null; then
+    local n=0
+    while IFS= read -r f; do
+      local bot; bot=$(basename "$(dirname "$(dirname "$f")")")
+      mkdir -p "$out/$bot"
+      cp "$f" "$out/$bot/"
+      n=$((n+1))
+    done < <(find "$tmp" -name '*.json' 2>/dev/null)
+    rm -rf "$tmp"
+    ok "取回 $n 个结果 → $out/"
+    [ "$n" -gt 0 ] && find "$out" -name '*.json' | sort | sed 's|^|    |'
+  else
+    rm -rf "$tmp"; warn "没有结果可取"
+  fi
+}
+
+# ============ clean ============
+cmd_clean() {
+  load_config
+  read -r -p "确认清空 $GBQ_SSH_HOST:$GBQ_REMOTE_ROOT 下所有队列? [y/N] " a
+  [ "$a" = "y" ] || { echo "已取消"; return 0; }
+  gssh "rm -rf '$GBQ_REMOTE_ROOT'/*/inbox/*.task '$GBQ_REMOTE_ROOT'/*/outbox/*.json 2>/dev/null; echo cleaned"
+  ok "队列已清空"
+}
+
+# ============ send ============
+cmd_send() {
+  load_config
+  local bot=""
+  [ "${1:-}" = "-b" ] && { bot="$2"; shift 2; }
+  local msg="${1:-}"
+  [ -z "$msg" ] && die "用法: gbq send [-b <bot>] '消息'"
+  local res
+  if [ -n "$bot" ]; then res=$(bot_dispatch "$bot" "$msg") || true
+  else                   res=$(bot_send "$msg") || true; fi
+  inspector_close
+  case "$res" in
+    *SENT*) ok "已发送${bot:+ → $bot}" ;;
+    *) die "发送失败: $res" ;;
+  esac
+}
+
+# ============ run ============
+cmd_run() {
+  cmd_submit "$@"
+  cmd_dispatch
+  cmd_wait || true
+  cmd_collect
+}
+
+# ============ main ============
+case "${1:-}" in
+  setup)    shift; cmd_setup "$@" ;;
+  bots)     shift; cmd_bots "$@" ;;
+  submit)   shift; cmd_submit "$@" ;;
+  dispatch) shift; cmd_dispatch "$@" ;;
+  status)   shift; cmd_status "$@" ;;
+  wait)     shift; cmd_wait "$@" ;;
+  collect)  shift; cmd_collect "$@" ;;
+  clean)    shift; cmd_clean "$@" ;;
+  send)     shift; cmd_send "$@" ;;
+  run)      shift; cmd_run "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "未知命令: $1（gbq --help 看用法）" ;;
+esac

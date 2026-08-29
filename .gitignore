@@ -1,0 +1,7 @@
+# 收割回来的结果
+gbq-results/
+# 本地配置（真实路径在 ~/.config/gbq/config，这里只做保险）
+config
+*.local
+# 系统
+.DS_Store
