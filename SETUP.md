@@ -66,10 +66,17 @@ ssh-keygen -t ed25519 -f ~/.ssh/grokbot_ed25519 -N ''
 
 ## 用法
 
+gbq 是一组**原语**，怎么分配、发什么由你（或你的 Agent）判断，工具不替你决策。
+
 ```bash
 gbq bots                              # 列出可用 Bot
 
-# 一条龙：提交 → 唤醒 → 等待 → 取回
+# 一问一答（最常用）
+gbq ask  -b <bot> '问题'               # 发消息 + 等回复 + 打印
+gbq send -b <bot> '消息'               # 只发不等
+gbq read -b <bot> [-n N]              # 读某 Bot 最近对话
+
+# 批量并行：一条龙
 gbq run '任务A' '任务B' '任务C'
 
 # 或者分步
@@ -84,6 +91,10 @@ gbq clean                             # 清空队列
 ```
 
 结果落到 `./gbq-results/<bot>/<任务id>.json`。
+
+**什么时候用哪个**：一问一答用 `ask`；3 个以上互相独立的任务才值得走队列（队列的价值是投递成本按 Bot 数而非任务数，任务少时不划算）。
+
+`ask` 的完成判定靠 UI 的 `<bot> is working` 状态，而不是「多久没新消息」—— 后者会把 Bot 搜索/思考时的静默期误判成结束。
 
 ### 让 Bot 看到你的项目代码
 
@@ -151,6 +162,7 @@ ln -s "$PWD/.claude/skills/grokbot" ~/.claude/skills/grokbot
 | Bot 共享一台机器 | 不是每 Bot 一台。共享 CPU / 内存 / 文件系统 |
 | 依赖 UI 自动化 | 靠 Electron inspector 操作 Grok Bot 界面。升级后 DOM 选择器可能失效，已做三级降级兜底（见下） |
 | sshd 不抗重启 | 云端容器重启后 sshd 会丢，需重跑那段安装命令 |
+| 云端网络有屏蔽 | 实测 `theblock.co` / `cointelegraph.com` / Google News 返回 `ERR_BLOCKED_BY_RESPONSE`，CoinDesk 正常。调研类任务要让 Bot 说明数据来自哪个站，并留意它是否被挡 |
 
 ---
 

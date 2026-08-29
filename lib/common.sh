@@ -187,3 +187,73 @@ ctx_sync() {
   rm -f "$exc"
   return "$rc"
 }
+
+# ---------- 读 Bot 对话（不经过 UI，直接读云端 transcript）----------
+# Bot 名 → agent uuid。同名时取 transcript 最近更新的那个（另一个多半是残留）。
+bot_uuid() {
+  local name="$1"
+  gssh "bash -s" <<REMOTE
+best=""; bestmt=0
+for d in /home/box/sand-data/agents/*/; do
+  id=\$(basename "\$d")
+  n=\$(python3 -c "import json;print(json.load(open('\$d/profile.json')).get('name',''))" 2>/dev/null)
+  [ "\$n" = "$name" ] || continue
+  t="/home/box/sand-data/agent-transcripts/\$id/\$id.jsonl"
+  mt=\$( [ -f "\$t" ] && stat -c %Y "\$t" 2>/dev/null || echo 0 )
+  if [ "\$mt" -ge "\$bestmt" ]; then bestmt=\$mt; best=\$id; fi
+done
+printf '%s' "\$best"
+REMOTE
+}
+
+# 读某 Bot 最近 N 条消息。$1=bot名 $2=条数(默认6)
+bot_read() {
+  local uuid; uuid=$(bot_uuid "$1")
+  [ -z "$uuid" ] && { echo "BOT_NOT_FOUND"; return 1; }
+  gssh "tail -n ${2:-6} /home/box/sand-data/agent-transcripts/$uuid/$uuid.jsonl 2>/dev/null" \
+  | ONLY_ASSISTANT="${3:-1}" python3 -c "
+import json,os,sys
+ONLY_ASSISTANT = os.environ.get('ONLY_ASSISTANT','1') == '1' 
+for line in sys.stdin:
+    line=line.strip()
+    if not line: continue
+    try: d=json.loads(line)
+    except Exception: continue
+    role=d.get('role','?')
+    parts=[]
+    for c in (d.get('message',{}) or {}).get('content',[]) or []:
+        if c.get('type')=='text' and c.get('text'): parts.append(c['text'])
+    txt=' '.join(parts).strip()
+    if not txt: continue
+    # Grok Bot 会把自己的 agent-loop 系统提示追加在消息尾部。它和真正的
+    # 内容在同一条消息里，所以要从标记处截断，不能整条丢弃 —— 整条丢会把
+    # Bot 的实际产出一起弄没。
+    txt = txt.replace('[SAND_HIDDEN_PROMPT]', '').lstrip()
+    for mark in ('Pick the work back up:', 'Keep your status current'):
+        i = txt.find(mark)
+        if i > 0: txt = txt[:i].rstrip()
+    if not txt: continue
+    if ONLY_ASSISTANT and role != 'assistant': continue
+    print(f'[{role}] {txt}')
+"
+}
+
+# transcript 当前行数（用于检测新回复）
+bot_msg_count() {
+  local uuid; uuid=$(bot_uuid "$1")
+  [ -z "$uuid" ] && { echo 0; return 1; }
+  gssh "wc -l < /home/box/sand-data/agent-transcripts/$uuid/$uuid.jsonl 2>/dev/null || echo 0" | tr -d ' '
+}
+
+# Bot 是否还在干活。UI 会显示 "<name> is working" —— 这是判断「答完没」
+# 唯一可靠的信号：光看 transcript 不增长会把搜索/思考的静默期误判成结束。
+bot_working() {
+  local b64; b64=$(printf '%s' "$1" | base64)
+  render_js "
+    (() => {
+      const name = new TextDecoder().decode(Uint8Array.from(atob('$b64'), c => c.charCodeAt(0)));
+      const t = document.body.innerText || '';
+      return (t.includes(name + ' is working') || t.includes(name + ' is typing')) ? 'WORKING' : 'IDLE';
+    })()
+  "
+}

@@ -12,7 +12,9 @@
 #   gbq status                   查看各队列状态
 #   gbq collect [-o 目录]         把结果取回本地
 #   gbq wait [--timeout 秒]       等到所有任务完成
-#   gbq send -b <bot> <消息>      直接给某个 Bot 发一条消息（不走队列）
+#   gbq send -b <bot> <消息>      给某个 Bot 发消息（不等回复）
+#   gbq read -b <bot> [-n N] [-A] 读某个 Bot 最近对话（-A 只看回复）
+#   gbq ask  -b <bot> <问题>      发消息并等回复（一问一答，Agent 最常用）
 #   gbq ctx add <目录> [名字]     注册项目上下文（多项目）
 #   gbq ctx list|sync|rm         管理上下文
 #   gbq run --ctx <名字> <任务>   派任务前先把该项目同步到云端
@@ -25,7 +27,7 @@ GBQ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$GBQ_ROOT/lib/common.sh"
 
 # -E 必须加：BSD sed(macOS) 不认 \? 和 \+，同一个坑踩过两次
-usage() { sed -n '2,20p' "$0" | sed -E 's/^# ?//'; }
+usage() { sed -n '2,22p' "$0" | sed -E 's/^# ?//'; }
 
 # ============ setup ============
 cmd_setup() {
@@ -335,6 +337,75 @@ cmd_send() {
   esac
 }
 
+# ============ read / ask ============
+cmd_read() {
+  load_config
+  local bot="" n=6 only=0
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -b) bot="$2"; shift 2 ;;
+      -n) n="$2"; shift 2 ;;
+      -A) only=1; shift ;;      # 只看 Bot 的 assistant 回复
+      *)  shift ;;
+    esac
+  done
+  [ -z "$bot" ] && die "用法: gbq read -b <bot> [-n 条数] [-A 只看回复]"
+  local out; out=$(bot_read "$bot" "$n" "$only")
+  [ "$out" = "BOT_NOT_FOUND" ] && die "找不到 Bot: $bot（gbq bots 看可用的）"
+  echo "$out"
+}
+
+# 发消息 → 等新回复 → 打印。Agent 做一问一答用这个。
+cmd_ask() {
+  load_config
+  local bot="" timeout=300
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -b)        bot="$2"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      *)         break ;;
+    esac
+  done
+  local msg="${1:-}"
+  [ -z "$bot" ] || [ -z "$msg" ] && die "用法: gbq ask -b <bot> '问题' [--timeout 秒]"
+
+  local before; before=$(bot_msg_count "$bot")
+  [ "$before" = "0" ] && ! bot_uuid "$bot" >/dev/null && die "找不到 Bot: $bot"
+
+  local res; res=$(bot_dispatch "$bot" "$msg") || true
+  case "$res" in
+    *SENT*) ;;
+    *) die "发送失败: $res" ;;
+  esac
+  inspector_close
+  info "已发给 ${bot}，等回复…"
+
+  local t0; t0=$(date +%s)
+  local last=$before stable=0
+  while :; do
+    sleep 5
+    # UI 的 "<bot> is working" 是唯一可靠的忙碌信号。只看 transcript 不增长
+    # 会把 Bot 搜索/思考时的静默期误判成「答完了」。
+    local w; w=$(bot_working "$bot" 2>/dev/null || echo IDLE)
+    local now; now=$(bot_msg_count "$bot")
+    [ "$now" -gt "$last" ] && { last=$now; }
+    case "$w" in
+      *WORKING*) stable=0 ;;
+      *)         [ "$now" -gt "$before" ] && stable=$((stable+1)) ;;
+    esac
+    # 空闲 + 有新内容 + 连续 2 次(10s)确认 → 答完
+    [ "$stable" -ge 2 ] && break
+    local el=$(( $(date +%s) - t0 ))
+    if [ "$el" -ge "$timeout" ]; then
+      warn "等待超时（${timeout}s），输出目前已有的内容"
+      break
+    fi
+  done
+  inspector_close
+  echo
+  bot_read "$bot" $(( last - before + 2 ))
+}
+
 # ============ ctx ============
 cmd_ctx() {
   load_config
@@ -489,6 +560,8 @@ case "${1:-}" in
   collect)  shift; cmd_collect "$@" ;;
   clean)    shift; cmd_clean "$@" ;;
   send)     shift; cmd_send "$@" ;;
+  read)     shift; cmd_read "$@" ;;
+  ask)      shift; cmd_ask "$@" ;;
   doctor)   shift; cmd_doctor "$@" ;;
   ctx)      shift; cmd_ctx "$@" ;;
   run)      shift; cmd_run "$@" ;;

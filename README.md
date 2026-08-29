@@ -69,6 +69,19 @@ A: -E。不加时 BSD sed(macOS) 不支持 \+，空格不会被替换   ✓
 
 ---
 
+## 设计取向：原语，不是框架
+
+gbq 只提供原语，**不内置角色/profile 配置**。怎么分配任务、哪个 Bot 干什么，交给调用方（通常是本地 Agent）判断 —— 它本来就有判断力，用配置文件固化反而限制灵活性。
+
+```bash
+gbq ask  -b <bot> '问题'      # 一问一答
+gbq send -b <bot> '消息'
+gbq read -b <bot> [-n N]     # 读对话，可用来判断该派给谁
+gbq submit -b <bot> '任务'    # 进队列
+```
+
+`gbq read` 让 Agent 能先看某个 Bot 最近在干什么，再决定派给谁 —— **动态判断，而不是静态配置**。这也顺着 Grok Bot 有持久记忆的特性：让 Bot 自然形成专长，比预先分配角色更合适。
+
 ## 架构
 
 ```
@@ -145,6 +158,7 @@ tailnet 上只有一个节点、一个 `box` 用户、一个 SSH 端点。隔离
 3. **依赖 UI 自动化** —— Grok Bot 升级后 L1 选择器可能失效，已有 L2/L3 兜底，`gbq doctor` 可诊断
 4. **sshd 不抗容器重启** —— 手动 `nohup` 拉起的，不是 systemd 服务
 5. **文件系统不隔离** —— 所有 Bot 都能读写 `/workspace`，gbq 按 Bot 分子目录规避
+6. **云端网络有屏蔽** —— 实测 `theblock.co`、`cointelegraph.com`、Google News 被挡（`ERR_BLOCKED_BY_RESPONSE`），CoinDesk 可用。调研类任务要留意来源覆盖面
 
 ---
 
