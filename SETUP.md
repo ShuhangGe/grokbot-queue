@@ -85,6 +85,41 @@ gbq clean                             # 清空队列
 
 结果落到 `./gbq-results/<bot>/<任务id>.json`。
 
+### 让 Bot 看到你的项目代码
+
+Bot 的云端机器上默认没有你的项目。注册并同步之后，Bot 就能直接读、grep 你的真实代码，而不用你在 prompt 里描述：
+
+```bash
+gbq ctx add ~/work/my-service          # 注册（名字默认取目录名）
+gbq ctx add ~/work/other-repo api      # 或指定名字
+gbq ctx list
+gbq run --ctx my-service '分析 xxx 模块的调用链'
+```
+
+`--ctx` 会在派发前自动增量同步，并在唤醒提示词里告诉 Bot 代码在 `/workspace/ctx/<名字>/`。
+
+实测速度（2.1MB / 250 文件）：首次全量 9.6s，增量 3.0s，无变化 1.7s。**增量比切换一个 Bot（4s）还快。**
+
+排除规则 = 项目自己的 `.gitignore` + 内置兜底（`.git`、`node_modules`、`__pycache__`、`dist`、`build` 等）。两者都用，因为 `.gitignore` 通常不排除 `.git` 本身。
+
+> 代码会被传到 Cursor 托管的机器上。那台机器的生命周期和快照策略不在你控制内 —— 敏感项目请自行评估。
+
+### 体检
+
+```bash
+gbq doctor
+```
+
+逐项报告本地依赖、SSH、远端 rsync、以及三级控制通道各自是否可用。**出任何问题先跑这个**。
+
+### 装成 Claude Code skill（可选）
+
+```bash
+ln -s "$PWD/.claude/skills/grokbot" ~/.claude/skills/grokbot
+```
+
+之后在任意 session 里说"派几个任务给 grokbot"，Claude 会自动加载用法，不用记命令。
+
 ---
 
 ## 工作原理
@@ -114,8 +149,24 @@ gbq clean                             # 清空队列
 | 投递串行 | 同一时刻只有一个 activeAgent，切换约 4 秒/Bot |
 | 上限 4–8 个 Bot | 再多，投递开销和 8 核 CPU 争抢会吃掉收益 |
 | Bot 共享一台机器 | 不是每 Bot 一台。共享 CPU / 内存 / 文件系统 |
-| 依赖 UI 自动化 | 靠 Electron inspector 操作 Grok Bot 界面，**Grok Bot 升级后 DOM 选择器可能失效** |
+| 依赖 UI 自动化 | 靠 Electron inspector 操作 Grok Bot 界面。升级后 DOM 选择器可能失效，已做三级降级兜底（见下） |
 | sshd 不抗重启 | 云端容器重启后 sshd 会丢，需重跑那段安装命令 |
+
+---
+
+## 三级降级
+
+控制 Grok Bot 没有官方 API，只能操作它的界面。为了扛住升级，做了三级兜底，自动切换：
+
+| 级别 | 手段 | 何时生效 |
+|---|---|---|
+| L1 | CDP + 精确选择器 | 默认，最快 |
+| L2 | CDP + 启发式（最宽的 contenteditable、按重复兄弟结构认列表） | Grok Bot 改了 class |
+| L3 | computer use（截图 + 点击） | DOM 整个不可用 |
+
+`gbq doctor` 会告诉你当前走哪一级。`GBQ_FORCE_LEVEL=2` 可强制某级（调试用）。
+
+**L3 有硬前提：Grok Bot 窗口必须在当前 Space。** 窗口在别的桌面时点击会返回成功但静默无效 —— 这是实测过的坑，所以 L3 会先检测并明确报错，不会假装成功。
 
 ---
 

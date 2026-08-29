@@ -8,6 +8,13 @@ gbq run '任务A' '任务B' '任务C' '任务D'
 
 → 任务轮流分给各 Bot，它们在云端并行跑，结果落到 `./gbq-results/<bot>/*.json`。
 
+带上你的项目代码一起派：
+
+```bash
+gbq ctx add ~/work/my-service
+gbq run --ctx my-service '分析 xxx 模块的调用链'
+```
+
 **安装配置看 [SETUP.md](SETUP.md)。**
 
 ---
@@ -48,6 +55,18 @@ collect   4/4 成功
 **SSH 并发**：3 连接 2.65s（串行需 6s+）。
 **连接复用**：冷启动 2.38s → 复用 0.47s。
 
+**上下文同步**（2.1MB / 250 文件）：首次 9.6s，增量 3.0s，无变化 1.7s —— 增量比切一个 Bot（4s）还快。
+
+**上下文有效性验证**：给 Bot 派了两个「只有读了代码才答得出」的问题（问代码注释里的内容），两个 Bot 都答对：
+
+```
+Q: lib/botctl.sh 实现了几级降级？
+A: L1 CDP+精确选择器；L2 CDP+启发式；L3 computer use   ✓
+
+Q: slugify 为什么必须加某个参数？
+A: -E。不加时 BSD sed(macOS) 不支持 \+，空格不会被替换   ✓
+```
+
 ---
 
 ## 架构
@@ -66,6 +85,21 @@ collect   4/4 成功
 ```
 
 **投递按 Bot 数计费，不按任务数。** 100 个任务分给 4 个 Bot，投递总共约 16 秒。
+
+### 三级降级（抗 Grok Bot 升级）
+
+控制 Bot 没有官方 API，只能操作界面，所以做了自动降级：
+
+| 级别 | 手段 | 何时生效 |
+|---|---|---|
+| L1 | CDP + 精确选择器 | 默认，最快 |
+| L2 | CDP + 启发式：最宽的 contenteditable 当输入框；按「同父节点重复兄弟结构」认 Bot 列表 | Grok Bot 改了 class |
+| L3 | computer use（cua-driver 截图+点击） | DOM 整个不可用 |
+
+L2 不依赖任何 `sand-*` class，实测输出与 L1 完全一致。
+L3 **要求窗口在当前 Space** —— off-Space 时点击会返回成功但静默无效（实测过），所以会先检测并明确报 `L3_WINDOW_OFF_SPACE`。
+
+`gbq doctor` 逐项报告哪级可用；`GBQ_FORCE_LEVEL=n` 强制指定。
 
 ### 两条控制通道
 
@@ -108,7 +142,7 @@ tailnet 上只有一个节点、一个 `box` 用户、一个 SSH 端点。隔离
 
 1. **投递串行** —— `activeAgentId` 唯一，切换约 4 秒/Bot
 2. **上限 4–8 个 Bot** —— 再多，投递开销和 8 核 CPU 争抢吃掉收益
-3. **依赖 UI 自动化** —— Grok Bot 升级后 DOM 选择器（`.sand-prompt-field`、`button.sand-agent-item`、`aria-label="Send message"`）可能失效
+3. **依赖 UI 自动化** —— Grok Bot 升级后 L1 选择器可能失效，已有 L2/L3 兜底，`gbq doctor` 可诊断
 4. **sshd 不抗容器重启** —— 手动 `nohup` 拉起的，不是 systemd 服务
 5. **文件系统不隔离** —— 所有 Bot 都能读写 `/workspace`，gbq 按 Bot 分子目录规避
 
@@ -117,9 +151,17 @@ tailnet 上只有一个节点、一个 `box` 用户、一个 SSH 端点。隔离
 ## 文件
 
 ```
-bin/gbq              主 CLI
-lib/common.sh        配置、SSH、Bot 层控制（CDP）
-lib/cdp.js           极简 CDP 客户端
-tasks.example.txt    批量任务示例
-SETUP.md             安装配置（给新用户）
+bin/gbq                        主 CLI
+lib/common.sh                  配置、SSH、上下文同步
+lib/botctl.sh                  三级降级的 Bot 控制
+lib/cdp.js                     极简 CDP 客户端
+.claude/skills/grokbot/        Claude Code skill
+tasks.example.txt              批量任务示例
+SETUP.md                       安装配置（给新用户）
+```
+
+装成 skill 后，在任意 session 里说「派几个任务给 grokbot」即可：
+
+```bash
+ln -s "$PWD/.claude/skills/grokbot" ~/.claude/skills/grokbot
 ```

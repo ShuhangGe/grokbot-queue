@@ -89,63 +89,24 @@ render_js() {
 }
 
 # 列出 Bot 名（每行一个）
-bot_list() {
-  render_js "
-    (() => {
-      const items = [...document.querySelectorAll('button.sand-agent-item')];
-      return items.map(el => ((el.querySelector('[class*=agent-item__name]')||{}).innerText||'').trim())
-                  .filter(Boolean).join('\\\\n');
-    })()
-  "
-}
+# ---------- 三级降级实现 ----------
+# shellcheck disable=SC1091
+. "$GBQ_ROOT/lib/botctl.sh"
 
-# 切换到指定 Bot。$1 = Bot 名
-bot_switch() {
-  local b64; b64=$(printf '%s' "$1" | base64)
-  render_js "
-    (() => {
-      const want = new TextDecoder().decode(Uint8Array.from(atob('$b64'), c => c.charCodeAt(0)));
-      const items = [...document.querySelectorAll('button.sand-agent-item')];
-      const t = items.find(el => ((el.querySelector('[class*=agent-item__name]')||{}).innerText||'').trim() === want);
-      if (!t) return 'BOT_NOT_FOUND';
-      t.click(); return 'SWITCHED';
-    })()
-  "
-}
-
-# 向当前 Bot 发消息。$1 = 文本
-bot_send() {
-  local b64; b64=$(printf '%s' "$1" | base64)
-  render_js "
-    (() => {
-      const txt = new TextDecoder().decode(Uint8Array.from(atob('$b64'), c => c.charCodeAt(0)));
-      const el = document.querySelector('.sand-prompt-field');
-      if (!el) return 'NO_INPUT_FIELD';
-      el.focus();
-      const r = document.createRange(); r.selectNodeContents(el);
-      const s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
-      document.execCommand('insertText', false, txt);
-      return (async () => {
-        for (let i = 0; i < 50; i++) {
-          const send = [...document.querySelectorAll('button')]
-            .find(b => (b.getAttribute('aria-label')||'') === 'Send message');
-          if (send && !send.disabled) { send.click(); return 'SENT'; }
-          await new Promise(r => setTimeout(r, 100));
-        }
-        return 'SEND_BUTTON_TIMEOUT';
-      })();
-    })()
-  "
-}
+# 对外接口保持不变，内部自动 L1 → L2 → L3 降级。
+# 实际用到的级别记在 GBQ_USED_LEVEL。
+bot_list()   { _try_levels list; }
+bot_switch() { _try_levels switch "$1"; }
+bot_send()   { _try_levels send "$1"; }
 
 # 切换 + 发送。$1 = Bot 名, $2 = 文本
 bot_dispatch() {
   local res
   res=$(bot_switch "$1") || true
   case "$res" in
-    *SWITCHED*) ;;
+    *SWITCHED*)      ;;
     *BOT_NOT_FOUND*) echo "BOT_NOT_FOUND"; return 1 ;;
-    *) echo "SWITCH_FAILED:$res"; return 1 ;;
+    *)               echo "SWITCH_FAILED:$res"; return 1 ;;
   esac
   sleep "${GBQ_SWITCH_WAIT:-2}"
   bot_send "$2"
@@ -156,4 +117,73 @@ slugify() {
   # -E 让 BSD sed(macOS) 和 GNU sed 都认 '+'；不加 -E 时 BSD sed 不支持 \+，
   # 空格不会被替换，会产出带空格的目录名。
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+# ---------- 项目上下文（多项目）----------
+GBQ_CTX_FILE="$GBQ_CONFIG_DIR/contexts"     # 每行: name<TAB>本地绝对路径
+GBQ_CTX_REMOTE="${GBQ_CTX_REMOTE:-/workspace/ctx}"
+
+ctx_list_raw() { [ -f "$GBQ_CTX_FILE" ] && cat "$GBQ_CTX_FILE" || true; }
+
+ctx_path_of() {
+  ctx_list_raw | awk -F'\t' -v n="$1" '$1==n{print $2; exit}'
+}
+
+ctx_add() {
+  local path name
+  path=$(cd "$1" 2>/dev/null && pwd) || { echo "路径不存在: $1"; return 1; }
+  name="${2:-$(basename "$path")}"
+  mkdir -p "$GBQ_CONFIG_DIR"; touch "$GBQ_CTX_FILE"
+  # 同名覆盖
+  local tmp; tmp=$(mktemp)
+  awk -F'\t' -v n="$name" '$1!=n' "$GBQ_CTX_FILE" > "$tmp" 2>/dev/null || true
+  printf '%s\t%s\n' "$name" "$path" >> "$tmp"
+  mv "$tmp" "$GBQ_CTX_FILE"; chmod 600 "$GBQ_CTX_FILE"
+  echo "$name"
+}
+
+ctx_rm() {
+  [ -f "$GBQ_CTX_FILE" ] || return 0
+  local tmp; tmp=$(mktemp)
+  awk -F'\t' -v n="$1" '$1!=n' "$GBQ_CTX_FILE" > "$tmp"
+  mv "$tmp" "$GBQ_CTX_FILE"; chmod 600 "$GBQ_CTX_FILE"
+}
+
+# 生成 rsync 排除清单：项目自己的 .gitignore + 内置兜底
+# （.gitignore 通常不排除 .git 本身，所以两者都要）
+_ctx_exclude_file() {
+  local src="$1" f; f=$(mktemp)
+  cat > "$f" <<'EOF'
+.git/
+node_modules/
+__pycache__/
+.venv/
+venv/
+dist/
+build/
+target/
+.next/
+.DS_Store
+*.pyc
+*.log
+EOF
+  [ -f "$src/.gitignore" ] && grep -vE '^\s*($|#)' "$src/.gitignore" >> "$f" 2>/dev/null || true
+  echo "$f"
+}
+
+# 同步一个上下文到云端。$1 = name
+ctx_sync() {
+  local name="$1" src exc
+  src=$(ctx_path_of "$name")
+  [ -z "$src" ] && { echo "未注册的上下文: $name"; return 1; }
+  [ -d "$src" ] || { echo "本地目录已不存在: $src"; return 1; }
+  gssh "command -v rsync >/dev/null 2>&1" || { echo "远端缺 rsync，跑 gbq doctor 看提示"; return 1; }
+  exc=$(_ctx_exclude_file "$src")
+  gssh "mkdir -p '$GBQ_CTX_REMOTE/$name'" >/dev/null
+  rsync -az --delete --exclude-from="$exc" \
+        -e "ssh -o BatchMode=yes -o ConnectTimeout=${GBQ_SSH_TIMEOUT:-25}" \
+        "$src/" "$GBQ_SSH_HOST:$GBQ_CTX_REMOTE/$name/" 2>&1 | tail -3
+  local rc=${PIPESTATUS[0]}
+  rm -f "$exc"
+  return "$rc"
 }

@@ -13,6 +13,10 @@
 #   gbq collect [-o 目录]         把结果取回本地
 #   gbq wait [--timeout 秒]       等到所有任务完成
 #   gbq send -b <bot> <消息>      直接给某个 Bot 发一条消息（不走队列）
+#   gbq ctx add <目录> [名字]     注册项目上下文（多项目）
+#   gbq ctx list|sync|rm         管理上下文
+#   gbq run --ctx <名字> <任务>   派任务前先把该项目同步到云端
+#   gbq doctor                   体检：逐项报告哪一级通道可用
 #   gbq clean                    清空队列
 set -euo pipefail
 
@@ -21,7 +25,7 @@ GBQ_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 . "$GBQ_ROOT/lib/common.sh"
 
 # -E 必须加：BSD sed(macOS) 不认 \? 和 \+，同一个坑踩过两次
-usage() { sed -n '2,16p' "$0" | sed -E 's/^# ?//'; }
+usage() { sed -n '2,20p' "$0" | sed -E 's/^# ?//'; }
 
 # ============ setup ============
 cmd_setup() {
@@ -139,12 +143,13 @@ _load_bots() {
 # ============ submit ============
 cmd_submit() {
   load_config
-  local target_bot="" from_file="" tasks=()
+  local target_bot="" from_file="" ctx="" tasks=()
   while [ $# -gt 0 ]; do
     case "$1" in
-      -b) target_bot="$2"; shift 2 ;;
-      -f) from_file="$2"; shift 2 ;;
-      *)  tasks+=("$1"); shift ;;
+      -b)     target_bot="$2"; shift 2 ;;
+      -f)     from_file="$2"; shift 2 ;;
+      --ctx)  ctx="$2"; shift 2 ;;
+      *)      tasks+=("$1"); shift ;;
     esac
   done
   if [ -n "$from_file" ]; then
@@ -183,13 +188,32 @@ echo '  $id -> $bot'"
     i=$((i+1))
   done
   gssh "$script"
+
+  if [ -n "$ctx" ]; then
+    [ -z "$(ctx_path_of "$ctx")" ] && die "未注册的上下文: $ctx（先 gbq ctx add）"
+    info "同步项目上下文 ${ctx}…"
+    ctx_sync "$ctx" || die "上下文同步失败"
+    gssh "printf '%s' '$ctx' > '$GBQ_REMOTE_ROOT/.ctx'"
+    ok "上下文 $ctx → $GBQ_CTX_REMOTE/$ctx"
+  else
+    gssh "rm -f '$GBQ_REMOTE_ROOT/.ctx' 2>/dev/null || true"
+  fi
   ok "已写入队列。下一步: gbq dispatch"
 }
 
 # ============ dispatch ============
 _wake_prompt() {
   local slug="$1"
+  local ctx_line=""
+  local ctx; ctx=$(gssh "cat '$GBQ_REMOTE_ROOT/.ctx' 2>/dev/null" || true)
+  if [ -n "$ctx" ]; then
+    ctx_line="本次任务相关的项目代码已同步到 $GBQ_CTX_REMOTE/$ctx/ ，需要时直接去读、grep、分析。
+注意那是只读参考副本，不要修改它；产出写到 outbox。
+
+"
+  fi
   cat <<EOF
+${ctx_line}
 你有一批任务在 $GBQ_REMOTE_ROOT/$slug/inbox/ 目录下，请按下面的协议自主处理，不要问我问题：
 
 1. 用 ls 列出 $GBQ_REMOTE_ROOT/$slug/inbox/*.task
@@ -311,6 +335,141 @@ cmd_send() {
   esac
 }
 
+# ============ ctx ============
+cmd_ctx() {
+  load_config
+  case "${1:-list}" in
+    add)
+      shift
+      [ -z "${1:-}" ] && die "用法: gbq ctx add <本地目录> [名字]"
+      local n; n=$(ctx_add "$1" "${2:-}") || exit 1
+      ok "已注册上下文 '$n' → $(ctx_path_of "$n")"
+      info "首次同步: gbq ctx sync $n"
+      ;;
+    list)
+      local raw; raw=$(ctx_list_raw)
+      [ -z "$raw" ] && { echo "(还没注册任何上下文，用 gbq ctx add <目录>)"; return 0; }
+      printf '%-20s %s\n' 'NAME' 'LOCAL PATH'
+      echo "$raw" | while IFS=$'\t' read -r n p; do printf '%-20s %s\n' "$n" "$p"; done
+      ;;
+    sync)
+      shift
+      local names
+      if [ -n "${1:-}" ]; then names="$1"; else names=$(ctx_list_raw | cut -f1); fi
+      [ -z "$names" ] && die "没有可同步的上下文"
+      for n in $names; do
+        info "同步 ${n}…"
+        if ctx_sync "$n"; then ok "$n 已同步 → $GBQ_CTX_REMOTE/$n"
+        else warn "$n 同步失败"; fi
+      done
+      ;;
+    rm)
+      shift; [ -z "${1:-}" ] && die "用法: gbq ctx rm <名字>"
+      ctx_rm "$1"; ok "已移除 $1（云端副本保留，需要的话手动删 $GBQ_CTX_REMOTE/$1）"
+      ;;
+    *) die "未知子命令: $1（add|list|sync|rm）" ;;
+  esac
+}
+
+# ============ doctor ============
+_d_ok()   { printf "  \033[32m✓\033[0m %-30s %s\n" "$1" "${2:-}"; }
+_d_bad()  { printf "  \033[31m✗\033[0m %-30s %s\n" "$1" "${2:-}"; }
+_d_warn() { printf "  \033[33m!\033[0m %-30s %s\n" "$1" "${2:-}"; }
+
+cmd_doctor() {
+  echo "${_c_bld}gbq doctor${_c_off}"
+  echo
+  echo "本地环境"
+  for c in ssh node python3 curl lsof; do
+    command -v "$c" >/dev/null 2>&1 && _d_ok "$c" || _d_bad "$c" "未安装"
+  done
+  command -v cua-driver >/dev/null 2>&1 && _d_ok "cua-driver" "(L3 需要)" || _d_warn "cua-driver" "未安装，L3 不可用"
+
+  echo
+  echo "配置"
+  if [ -f "$GBQ_CONFIG" ]; then
+    _d_ok "配置文件" "$GBQ_CONFIG"
+    . "$GBQ_CONFIG"
+    : "${GBQ_REMOTE_ROOT:=/workspace/gbq}"
+    : "${GBQ_APP_PROC:=MacOS/Grok Bot}"
+    : "${GBQ_INSPECT_PORT:=9229}"
+    _d_ok "SSH 目标" "$GBQ_SSH_HOST"
+  else
+    _d_bad "配置文件" "缺失，先跑 gbq setup"; return 1
+  fi
+
+  echo
+  echo "SSH 通道"
+  if check_ssh; then
+    _d_ok "SSH 连接"
+    for c in rsync tar; do
+      if gssh "command -v $c" >/dev/null 2>&1; then _d_ok "远端 $c"
+      else _d_warn "远端 $c" "缺失（gbq sync 需要 rsync）"; fi
+    done
+    gssh "test -d '$GBQ_REMOTE_ROOT'" >/dev/null 2>&1 \
+      && _d_ok "队列目录" "$GBQ_REMOTE_ROOT" || _d_warn "队列目录" "不存在，首次 submit 会自动建"
+  else
+    _d_bad "SSH 连接" "连不上 $GBQ_SSH_HOST"
+    _d_warn "" "云端容器重启会丢 sshd，见 SETUP.md"
+  fi
+
+  echo
+  echo "Bot 通道"
+  local pid; pid=$(_app_pid || true)
+  if [ -n "$pid" ]; then
+    _d_ok "Grok Bot 进程" "pid=$pid"
+  else
+    _d_bad "Grok Bot 进程" "未运行"; echo; return 1
+  fi
+  local ws; ws=$(_inspector_ws 2>/dev/null || true)
+  case "$ws" in
+    ws://*) _d_ok "Electron inspector" "端口 $GBQ_INSPECT_PORT" ;;
+    *)      _d_bad "Electron inspector" "$ws"; echo; return 1 ;;
+  esac
+
+  # L1：逐个选择器验证
+  local probe
+  probe=$(render_js "
+    (() => JSON.stringify({
+      input: !!document.querySelector('$_sel_input'),
+      items: document.querySelectorAll('$_sel_item').length,
+      send:  [...document.querySelectorAll('button')].some(b => (b.getAttribute('aria-label')||'') === '$_sel_send')
+    }))()
+  " 2>/dev/null || true)
+  local i_ok it_n
+  i_ok=$(echo "$probe"  | python3 -c "import json,sys; print(json.load(sys.stdin)['input'])" 2>/dev/null || echo False)
+  it_n=$(echo "$probe"  | python3 -c "import json,sys; print(json.load(sys.stdin)['items'])" 2>/dev/null || echo 0)
+  [ "$i_ok" = "True" ] && _d_ok "L1 输入框选择器" "$_sel_input" || _d_bad "L1 输入框选择器" "$_sel_input 未命中"
+  [ "${it_n:-0}" -gt 0 ] && _d_ok "L1 Bot 列表选择器" "$it_n 项" || _d_bad "L1 Bot 列表选择器" "$_sel_item 未命中"
+  # 发送键只在输入框非空时出现，未命中不算故障
+  _d_warn "L1 发送键" "仅在输入框有内容时出现，此处不判定"
+
+  # L2
+  local l2; l2=$(GBQ_FORCE_LEVEL=2 _l2_list 2>/dev/null || true)
+  case "$l2" in
+    L2_*|"") _d_bad "L2 启发式" "识别不到 Bot 列表" ;;
+    *)       _d_ok "L2 启发式" "$(echo "$l2" | tr '\n' ',' | sed 's/,$//')" ;;
+  esac
+
+  # L3
+  local l3; l3=$(_l3_available 2>/dev/null || true)
+  case "$l3" in
+    [0-9]*)              _d_ok "L3 computer use" "可用" ;;
+    L3_WINDOW_OFF_SPACE) _d_warn "L3 computer use" "窗口不在当前 Space，需把 Grok Bot 挪到当前桌面" ;;
+    *)                   _d_warn "L3 computer use" "$l3" ;;
+  esac
+  inspector_close
+
+  echo
+  local lv=1
+  [ "$i_ok" = "True" ] && [ "${it_n:-0}" -gt 0 ] || lv=2
+  echo "${_c_bld}结论${_c_off}: 当前将走 L$lv 通道"
+  if [ "$lv" != 1 ]; then
+    echo "  L1 选择器已失效（Grok Bot 可能升级过），L2 启发式接管；若 L2 也不行，把窗口挪到当前桌面用 L3。"
+  fi
+  return 0
+}
+
 # ============ run ============
 cmd_run() {
   cmd_submit "$@"
@@ -330,6 +489,8 @@ case "${1:-}" in
   collect)  shift; cmd_collect "$@" ;;
   clean)    shift; cmd_clean "$@" ;;
   send)     shift; cmd_send "$@" ;;
+  doctor)   shift; cmd_doctor "$@" ;;
+  ctx)      shift; cmd_ctx "$@" ;;
   run)      shift; cmd_run "$@" ;;
   ""|-h|--help|help) usage ;;
   *) die "未知命令: $1（gbq --help 看用法）" ;;
