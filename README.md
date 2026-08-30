@@ -1,136 +1,192 @@
-# gbq — 把活派给云端的 Grok Bot
+# gbq — run tasks on multiple Cursor Grok Bots, in parallel
 
-让 Cursor Grok Bot 替你干活，**本地内存开销恒定 ≈400MB，不随任务数或 Bot 数增长** —— 执行全在云端。
+**English** · [简体中文](README.zh-CN.md)
+
+Your laptop's RAM stays flat no matter how many tasks you fan out. The work
+happens on Grok Bot's cloud machine; locally there is only one Electron UI.
 
 ```bash
-gbq ask -b walle '查一下最近一周 crypto 圈有什么大新闻，注明来源和日期'
+gbq ask -b my-bot 'What are the notable crypto stories this week? Cite sources and dates.'
 ```
 
-Bot 会真的开浏览器去查，回来给你带 URL 和日期的结果。
+The Bot opens a real browser, reads live pages, and comes back with URLs and
+datelines.
+
+```bash
+gbq run 'audit error handling in src/api' 'summarize the test gaps' 'check for unused deps'
+```
+
+Three tasks, distributed across your Bots, running at the same time.
 
 ---
 
-## 能干什么
+## Why this exists
 
-| 想做的事 | 命令 |
-|---|---|
-| 问一句、要个调研 | `gbq ask -b <bot> '问题'` |
-| 让它读你的项目代码干活 | `gbq ctx add ~/my-project` → `gbq run --ctx my-project '任务'` |
-| 一批独立任务并行跑 | `gbq run '任务A' '任务B' '任务C'` |
-| 看某个 Bot 最近在忙什么 | `gbq read -b <bot>` |
+Running N agents locally costs N × 150–335 MB and climbs with every task you
+add. gbq holds at **~400 MB regardless of how many Bots or tasks you run**,
+because each Bot has its own `exec-daemon` process in the cloud and your
+machine only hosts the UI shell.
 
-实测：2 个 Bot 并行加速比 **1.88x**；4 个任务 26 秒跑完。
+Measured on a 2-Bot setup:
 
-**为什么不直接在本地多开几个 agent** —— 本地每个 agent 实例吃 150–335MB 且线性增长；gbq 固定 400MB，从第 3 个任务起就开始净赚。
+| | Local agents | gbq |
+|---|---|---|
+| RAM on your machine | 150–335 MB × N | **~400 MB, flat** |
+| Where work runs | your laptop | cloud (8 cores / 15 GiB) |
+| Break-even | — | 3rd concurrent task |
+
+Two Bots running 30-second tasks overlapped for 28 of those seconds — **1.88x
+wall-clock speedup**, verified by timestamp, not by assumption. A 4-task batch
+finished in 26 seconds.
 
 ---
 
-## 5 分钟上手
+## Quick start
 
-**前置**：Grok Bot 桌面应用在跑、Tailscale 两端登录同一账号、本机有 `ssh node python3 curl lsof`。
+You need: the Grok Bot desktop app running, Tailscale on both ends under the
+same account, and `ssh node python3 curl lsof` locally.
 
 ```bash
 git clone https://github.com/ShuhangGe/grokbot-queue ~/gbq
 cd ~/gbq && chmod +x bin/gbq
-export PATH="$HOME/gbq/bin:$PATH"      # 建议写进 ~/.zshrc
+export PATH="$HOME/gbq/bin:$PATH"
 
-gbq setup      # 引导式，会自动探测 Tailscale 上的 Linux 节点
-gbq doctor     # 体检 —— 以后出任何问题都先跑这个
-gbq bots       # 看有哪些 Bot
-gbq ask -b <bot名> '报一下你所在机器的内核版本'
+gbq setup      # guided; auto-detects the Linux node on your tailnet
+gbq doctor     # health check — run this first whenever something breaks
+gbq bots
+gbq ask -b <bot> 'print the kernel version of the machine you are on'
 ```
 
-⚠️ **`gbq setup` 第一次大概率卡在 SSH** —— 云端机器默认没装 sshd，这是正常的。向导会打印一段命令，**贴给任意一个 Bot 执行**，然后重跑 setup。完整说明见 [SETUP.md](SETUP.md)。
+**`gbq setup` will stop at the SSH step the first time. That is expected** —
+the cloud machine ships without `sshd`. The wizard prints a command; paste it
+to any Bot, then re-run setup. Full walkthrough in [SETUP.md](SETUP.md).
 
 ---
 
-## 命令速查
+## Commands
 
 ```bash
-gbq bots                          # 列出 Bot
-gbq ask  -b <bot> '问题'           # 发消息 + 等回复 + 打印（最常用）
-gbq send -b <bot> '消息'           # 只发不等
-gbq read -b <bot> [-n N] [-A]     # 读最近对话（-A 只看 Bot 回复）
+gbq bots                          # list Bots
+gbq ask  -b <bot> 'question'      # send, wait for the reply, print it
+gbq send -b <bot> 'message'       # fire and forget
+gbq read -b <bot> [-n N] [-A]     # read recent conversation
 
-gbq ctx add <本地目录> [名字]       # 注册项目上下文
+gbq ctx add <local-dir> [name]    # register a project so Bots can read your code
 gbq ctx list | sync | rm
-gbq run --ctx <名字> '任务'...      # 同步代码 + 派任务 + 等待 + 取回
+gbq run --ctx <name> 'task'...    # sync code, dispatch, wait, collect
 
-gbq submit [-b <bot>] '任务'...    # 只写队列不唤醒
-gbq dispatch                      # 唤醒有待办的 Bot
+gbq submit [-b <bot>] 'task'...   # queue without waking anyone
+gbq dispatch                      # wake Bots that have pending work
 gbq status | wait | collect | clean
 
-gbq doctor                        # 体检
+gbq doctor
 ```
 
-退出码：成功 `0`，失败非 `0`。
+Exit code `0` on success, non-zero on failure.
 
 ---
 
-## 给 AI Agent 用
+## How it works
 
-让 Claude / Cursor / 其他 agent 驱动 gbq 的话，**读 [AGENTS.md](AGENTS.md)** —— 那里有原语的精确语义、该在什么情况下用哪个、以及失败模式速查。
+Cursor ships no public API for Grok Bot. gbq drives it through two channels:
 
-Claude Code 用户可以直接装成 skill：
+```
+local                            cloud (one machine, Bots share it)
+  │
+  ├─ submit   ──SSH──────────>   /workspace/gbq/<bot>/inbox/*.task
+  │                              all task bodies in a single round trip
+  │
+  ├─ dispatch ─Electron CDP──>   one wake-up message per Bot
+  │                                      │
+  │                              Bots read their inbox and work in parallel
+  │                                      │
+  └─ collect  ──SSH──────────<   /workspace/gbq/<bot>/outbox/*.json
+```
+
+**Dispatch cost scales with the number of Bots, not the number of tasks.** One
+hundred tasks across four Bots still costs about 16 seconds to dispatch,
+because task bodies travel over SSH and only the wake-up goes through the UI.
+
+The UI channel works by sending `SIGUSR1` to the Grok Bot process, which opens
+a Node inspector; from there `webContents.executeJavaScript` reaches the
+renderer. Since that depends on DOM selectors that any Cursor release can
+change, there are three fallback levels:
+
+| Level | Mechanism | Kicks in when |
+|---|---|---|
+| L1 | CDP + exact selectors | default |
+| L2 | CDP + heuristics — widest `contenteditable`, list detected by repeated sibling structure | Cursor changes CSS classes |
+| L3 | computer use (screenshot + click) | the DOM is unreachable |
+
+L2 touches no `sand-*` class at all, and returns output identical to L1 in
+testing. `gbq doctor` reports which level is currently live.
+
+[INTERNALS.md](INTERNALS.md) documents the architecture and 16 gotchas found
+while building this — the Tailscale SSH daemon hijacking port 22, off-Space
+clicks that report success while doing nothing, ProseMirror ignoring direct
+DOM writes, and more.
+
+---
+
+## Using it from an AI agent
+
+Point your agent at [AGENTS.md](AGENTS.md) — it specifies each primitive's
+blocking behavior, stdout format, exit codes, and failure modes.
+
+Claude Code users can install the bundled skill:
 
 ```bash
 ln -s "$PWD/.claude/skills/grokbot" ~/.claude/skills/grokbot
 ```
 
-之后说一句「派几个任务给 grokbot」就行，不用记命令。
-
 ---
 
-## 原理
+## Limitations
 
-```
-本地                          云端（一台机器，多个 Bot 共享）
- │
- ├─ submit  ──SSH─────────>  /workspace/gbq/<bot>/inbox/*.task
- │                            任务内容一次 SSH 批量写入
- │
- ├─ dispatch ─Electron CDP─> 每个 Bot 一条唤醒消息
- │                                   │
- │                            Bot 们并行读 inbox、执行、写 outbox
- │                                   │
- └─ collect ──SSH─────────<  /workspace/gbq/<bot>/outbox/*.json
-```
+Stated plainly, because they shape whether this is useful to you:
 
-**投递成本按 Bot 数算，不按任务数。** 100 个任务分给 4 个 Bot，投递也只要约 16 秒。
-
-Cursor 没有公开 Grok Bot API，控制靠操作它的 Electron 界面。为了扛住版本升级做了三级自动降级（L1 精确选择器 → L2 启发式 → L3 computer use），`gbq doctor` 会告诉你当前走哪级。细节见 [INTERNALS.md](INTERNALS.md)。
-
----
-
-## 限制
-
-| 限制 | 说明 |
+| Limitation | Detail |
 |---|---|
-| 投递串行 | 同一时刻只有一个 activeAgent，切换约 4 秒/Bot |
-| 上限 4–8 个 Bot | 再多，投递开销和 8 核 CPU 争抢会吃掉收益 |
-| 多 Bot 共享一台机器 | 不是每 Bot 一台，共享 CPU / 内存 / `/workspace` |
-| Bot 有持久记忆 | 不像一次性 worker，跨任务会累积 —— 适合当「驻场同事」 |
-| sshd 不抗容器重启 | 重启后要重新拉起，见 SETUP.md |
-| 依赖 UI 自动化 | Grok Bot 升级可能打断 L1，有 L2/L3 兜底 |
-| 云端网络有屏蔽 | 实测 `theblock.co`、`cointelegraph.com`、Google News 被挡，CoinDesk 可用 |
+| Dispatch is serial | Only one Bot can be active at a time; switching costs ~4s each |
+| Practical ceiling: 4–8 Bots | Beyond that, dispatch overhead and 8-core contention eat the gains |
+| Bots share one machine | Not one machine per Bot — shared CPU, RAM, and `/workspace` |
+| Bots have persistent memory | Unlike disposable workers, context accumulates across tasks |
+| Everything depends on the desktop app running | Closing Grok Bot takes the cloud node offline too — **both** the SSH and CDP channels die |
+| `sshd` does not survive container restarts | Started with `nohup`, not systemd — see SETUP.md |
+| Built on UI automation | A Cursor update can break L1; L2 and L3 exist for that reason |
+| Some sites are blocked in the cloud | `theblock.co`, `cointelegraph.com`, Google News return `ERR_BLOCKED_BY_RESPONSE`; CoinDesk works |
 
 ---
 
-## 安全
+## Security
 
-- **`--ctx` 会把项目代码传到 Cursor 托管的机器上**，敏感项目请自行评估
-- 云端机器的生命周期和快照策略不由你控制，**别在上面放长期凭证**
-- `/workspace` 内容所有 Bot 都能看见
-- Electron inspector 开启期间 `127.0.0.1:9229` 对本机任何进程开放，gbq **每次用完自动关闭**
-- sshd 只监听 Tailscale 地址，公网扫不到；仅公钥认证，密码登录已关
+Read [SECURITY.md](SECURITY.md) before using this on anything sensitive. The
+short version:
+
+- While gbq is sending, `127.0.0.1:9229` accepts connections from **any local
+  process**, each of which could then fully control Grok Bot. gbq closes it
+  after every operation.
+- `gbq ctx sync` **uploads your source code** to a Cursor-hosted machine.
+- Never store long-lived credentials on that machine.
+- `sshd` binds to the Tailscale address only; use a dedicated key.
 
 ---
 
-## 文档
+## Contributing
 
-| 文件 | 给谁看 |
+See [CONTRIBUTING.md](CONTRIBUTING.md). The most valuable contribution is
+keeping the selectors working after Cursor updates — and recording whatever
+you learn in `INTERNALS.md`.
+
+## Docs
+
+| File | Audience |
 |---|---|
-| [SETUP.md](SETUP.md) | 安装、配置、排障 |
-| [AGENTS.md](AGENTS.md) | AI agent —— 原语语义、判断指引、失败模式 |
-| [INTERNALS.md](INTERNALS.md) | 维护者 —— 实现细节、实测数据、踩过的坑 |
-| `.claude/skills/grokbot/` | Claude Code skill |
+| [SETUP.md](SETUP.md) | installation, configuration, troubleshooting |
+| [AGENTS.md](AGENTS.md) | AI agents — primitive semantics, exit codes, failure modes |
+| [INTERNALS.md](INTERNALS.md) | maintainers — architecture, measurements, gotchas |
+| [README.zh-CN.md](README.zh-CN.md) | 中文文档 |
+
+## License
+
+MIT — see [LICENSE](LICENSE).

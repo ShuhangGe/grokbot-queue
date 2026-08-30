@@ -105,7 +105,25 @@ ln -s "$PWD/.claude/skills/grokbot" ~/.claude/skills/grokbot
 
 ### SSH 连不上
 
-**最常见原因是云端容器重启，sshd 丢了** —— 它是手动 `nohup` 拉起的，不是 systemd 服务。先确认：
+**先看节点在不在线** —— 这个症状最有迷惑性：
+
+```bash
+tailscale status | grep linux
+```
+
+节点不在线时，`nc -z <ip> 22` 仍会显示**端口通**（DERP 中继接受了 TCP），但 SSH 会报：
+
+```
+kex_exchange_identification: Connection closed by remote host
+```
+
+密钥交换都没开始就断了 —— 这不是认证失败，也不是 sshd 的问题，**是云端机器整个下线了**。
+
+实测观察到：**关闭 Grok Bot 桌面应用后，tailnet 上的云端节点也随之离线。** 想让 Bot 干活（或走 SSH），把桌面应用开着。
+
+节点在线但仍连不上，才往下看 ↓
+
+**第二常见的原因是云端容器重启，sshd 丢了** —— 它是手动 `nohup` 拉起的，不是 systemd 服务。先确认：
 
 ```bash
 nc -z <你的tailnet-ip> 22 && echo "sshd 在" || echo "sshd 没了"

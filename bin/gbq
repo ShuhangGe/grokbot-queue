@@ -181,7 +181,7 @@ cmd_submit() {
   for t in "${tasks[@]}"; do
     local bot="${BOTS[$((i % n))]}"
     local slug; slug=$(slugify "$bot")
-    local id="${stamp}-$(printf '%03d' $i)"
+    local id; id="${stamp}-$(printf '%03d' "$i")"
     local b64; b64=$(printf '%s' "$t" | base64 | tr -d '\n')
     script="$script
 mkdir -p '$GBQ_REMOTE_ROOT/$slug/inbox' '$GBQ_REMOTE_ROOT/$slug/outbox'
@@ -192,7 +192,7 @@ echo '  $id -> $bot'"
   gssh "$script"
 
   if [ -n "$ctx" ]; then
-    [ -z "$(ctx_path_of "$ctx")" ] && die "未注册的上下文: $ctx（先 gbq ctx add）"
+    [ -z "$(ctx_path_of "$ctx")" ] && die "未注册的上下文: ${ctx}（先 gbq ctx add）"
     info "同步项目上下文 ${ctx}…"
     ctx_sync "$ctx" || die "上下文同步失败"
     gssh "printf '%s' '$ctx' > '$GBQ_REMOTE_ROOT/.ctx'"
@@ -351,7 +351,7 @@ cmd_read() {
   done
   [ -z "$bot" ] && die "用法: gbq read -b <bot> [-n 条数] [-A 只看回复]"
   local out; out=$(bot_read "$bot" "$n" "$only")
-  [ "$out" = "BOT_NOT_FOUND" ] && die "找不到 Bot: $bot（gbq bots 看可用的）"
+  [ "$out" = "BOT_NOT_FOUND" ] && die "找不到 Bot: ${bot}（gbq bots 看可用的）"
   echo "$out"
 }
 
@@ -461,6 +461,7 @@ cmd_doctor() {
   echo "配置"
   if [ -f "$GBQ_CONFIG" ]; then
     _d_ok "配置文件" "$GBQ_CONFIG"
+    # shellcheck source=/dev/null
     . "$GBQ_CONFIG"
     : "${GBQ_REMOTE_ROOT:=/workspace/gbq}"
     : "${GBQ_APP_PROC:=MacOS/Grok Bot}"

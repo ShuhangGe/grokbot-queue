@@ -7,6 +7,9 @@
 #
 # 每一级都返回 SENT / SWITCHED 才算成功，否则落到下一级。
 # GBQ_FORCE_LEVEL=1|2|3 可强制指定级别（doctor 和调试用）。
+# 实际用到的级别写进 GBQ_USED_LEVEL，供调用方/调试读取。
+# shellcheck disable=SC2034
+GBQ_USED_LEVEL=""
 
 # ---------- L1：精确选择器 ----------
 _sel_input='.sand-prompt-field'

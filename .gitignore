@@ -5,3 +5,9 @@ config
 *.local
 # 系统
 .DS_Store
+.agents/
+
+# 外部 skill（做增长调研时装的工具，不属于本项目）
+.claude/skills/open-sourcing
+.claude/skills/gr-oss-marketing
+skills-lock.json

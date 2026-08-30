@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 最小权限：这个 workflow 只需要读代码
+permissions: {}
+
+jobs:
+  shell:
+    name: Shell lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      # pin 到 commit SHA 而非 tag —— tag 可被重新指向
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Syntax check
+        run: |
+          for f in bin/gbq lib/*.sh; do
+            echo "bash -n $f"
+            bash -n "$f"
+          done
+
+      - name: ShellCheck
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          # SC1091: 跟随 source 的外部文件在 CI 里不存在
+          # SC2181: $? 的用法在本项目里是刻意的
+          shellcheck -e SC1091,SC2181 -S warning bin/gbq lib/*.sh
+
+      - name: Guard against BSD-incompatible sed
+        run: |
+          # macOS 是主要目标平台，BSD sed 不认 \+ 和 \? —— 这个坑踩过两次
+          if grep -nE "sed [^|]*'s/[^']*\\\\[+?]" bin/gbq lib/*.sh | grep -v ' -E '; then
+            echo "::error::发现不带 -E 的 sed 用了 \\+ 或 \\?，BSD sed 不支持"
+            exit 1
+          fi
+          echo "OK"
+
+      - name: Guard against $var followed by non-ASCII
+        run: |
+          # bash 会把紧跟的 UTF-8 字节当成变量名的一部分 —— 必须写 ${var}
+          if grep -nP '\$[a-zA-Z_][a-zA-Z0-9_]*[^\x00-\x7F]' bin/gbq lib/*.sh; then
+            echo "::error::\$var 后面紧跟非 ASCII 字符，应写成 \${var}"
+            exit 1
+          fi
+          echo "OK"

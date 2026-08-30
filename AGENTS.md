@@ -83,7 +83,9 @@ gbq bots            # 每行一个 Bot 名，可能含空格（如 "New Bot"）�
 
 | 现象 | 原因 | 处理 |
 |---|---|---|
-| SSH 连不上 | **云端容器重启，sshd 丢了** —— 最常见 | 按 SETUP.md 让 Bot 重新拉起 sshd。**不要重新调研通道方案** |
+| SSH 报 `kex_exchange_identification: Connection closed` | **云端节点下线**（关掉 Grok Bot 桌面应用后会发生）。注意 `nc -z` 此时仍显示端口通，具有迷惑性 | `tailscale status \| grep linux` 确认；让用户打开 Grok Bot 应用 |
+| SSH 连不上（节点在线） | 容器重启，sshd 丢了 | 按 SETUP.md 让 Bot 重新拉起 sshd。**不要重新调研通道方案** |
+| `gbq bots` 报「应用未运行」+ SSH 也断 | **两条通道都依赖桌面应用**，它关了就都没了 | 让用户打开 Grok Bot |
 | `gbq bots` 空/报错 | Grok Bot 应用没开（最小化没关系，关掉才不行） | 让用户打开 |
 | doctor 报 L1 失效 | Grok Bot 升级改了 DOM | L2 会自动接管；L2 也失效才需要更新选择器 |
 | doctor 报 `L3_WINDOW_OFF_SPACE` | Grok Bot 窗口在别的桌面 | 只影响 L3。真要用 L3 得让用户把窗口挪到当前桌面 |

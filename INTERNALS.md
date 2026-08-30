@@ -120,6 +120,9 @@ tailnet 上只有一个节点、一个 `box` 用户、一个 SSH 端点。隔离
 | `while read` 的退出码 | 读到 EOF 时 `read` 返回 1，成了整条命令的退出码，`gbq ctx list` 误报失败 | 循环后加 `\|\| true` |
 | `ask` 把静默期当结束 | 用「N 秒没新消息=答完」，Bot 做浏览器搜索时的静默被误判，拿到「正在搜索」而非结果 | 改用 UI 的 `<bot> is working` 状态判定 |
 | `read` 过滤过头 | Grok Bot 把 agent-loop 系统提示追加在消息**尾部**，和真正产出同属一条消息；按整条过滤会把结果一起丢掉 | 从标记处**截断**，不整条丢弃 |
+| 节点离线时 `nc` 仍报端口通 | DERP 中继接受 TCP 但无法转发，SSH 卡在 `kex_exchange_identification`。容易误判成 sshd 故障 | 先 `tailscale status` 看节点在不在线 |
+| 关掉桌面应用 = 两条通道全断 | 云端节点随之离线，SSH 和 CDP 同时失效 | 干活期间保持 Grok Bot 开着 |
+| `$var` 紧跟中文（第二次） | `die "…: $ctx（…）"` 只在错误路径触发，正常测试碰不到，CI 守卫才抓出来 | CI 里加了 grep 守卫 |
 | zsh 不做词分割 | 测试脚本里 `./bin/gbq $c`（c="ctx list"）在 zsh 下传的是单个参数，误判成退出码 bug | 测试时用 `"$@"` 传参 |
 
 ---
