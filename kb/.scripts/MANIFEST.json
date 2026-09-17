@@ -1,0 +1,21 @@
+{
+  "lib.mjs": "3e7e641ee65c",
+  "new.mjs": "e0aef7a073cb",
+  "build-index.mjs": "37ecfe863d08",
+  "check-stale.mjs": "ade6d232bab6",
+  "review.mjs": "e8623ce93018",
+  "promote.mjs": "1fddd1338f2e",
+  "status.mjs": "31c800d8aebc",
+  "central.mjs": "42fa4dc76ece",
+  "validate.mjs": "c90f4964aac5",
+  "roundtrip-test.mjs": "5cdb62700f1c",
+  "retrieval-test.mjs": "5e5af32ec26b",
+  "feedback.mjs": "6014ed8a2b52",
+  "survey.mjs": "78506b4964e0",
+  "search.mjs": "e45a6d0e0b51",
+  "agent-block.md": "368ac0582916",
+  "agent-block-layer.md": "ff74ed66dc83",
+  "weekly-check.sh": "716c1eb1c0a2",
+  "pre-commit.sh": "4616b01fb736",
+  "VERSION": "065582655aac"
+}

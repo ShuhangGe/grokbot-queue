@@ -1,0 +1,2 @@
+# 这个项目【故意】不接 mindlink 路由块。规则在 ml skill 里，模型按需加载。
+# 删掉这个文件，mindlink upgrade 才会重新提醒「路由块 missing」。
