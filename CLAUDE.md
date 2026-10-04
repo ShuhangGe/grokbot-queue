@@ -1,2 +1,1 @@
-# grokbot_team
-
+@AGENTS.md
